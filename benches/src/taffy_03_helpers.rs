@@ -1,4 +1,4 @@
-use rand::distributions::uniform::SampleRange;
+use rand::distr::uniform::SampleRange;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use taffy::style::Style as TaffyStyle;
@@ -31,7 +31,7 @@ impl<R: Rng, G: GenStyle<TaffyStyle>> BuildTree<R, G> for Taffy03TreeBuilder<R, 
     }
 
     fn random_usize(&mut self, range: impl SampleRange<usize>) -> usize {
-        self.rng.gen_range(range)
+        self.rng.random_range(range)
     }
 
     fn create_leaf_node(&mut self) -> Self::Node {
@@ -120,25 +120,31 @@ fn convert_point<T, U, F: Fn(T) -> U>(input: taffy::geometry::Point<T>, map: F) 
 }
 
 fn convert_dimension(input: taffy::style::Dimension) -> taffy_03::style::Dimension {
-    match input {
-        taffy::style::Dimension::Length(val) => taffy_03::style::Dimension::Points(val),
-        taffy::style::Dimension::Percent(val) => taffy_03::style::Dimension::Percent(val),
-        taffy::style::Dimension::Auto => taffy_03::style::Dimension::Auto,
+    let raw = input.into_raw();
+    match raw.tag() {
+        taffy::style::CompactLength::LENGTH_TAG => taffy_03::style::Dimension::Points(raw.value()),
+        taffy::style::CompactLength::PERCENT_TAG => taffy_03::style::Dimension::Percent(raw.value()),
+        taffy::style::CompactLength::AUTO_TAG => taffy_03::style::Dimension::Auto,
+        _ => panic!("unsupported Dimension variant"),
     }
 }
 
 fn convert_length_percentage_auto(input: taffy::style::LengthPercentageAuto) -> taffy_03::style::LengthPercentageAuto {
-    match input {
-        taffy::style::LengthPercentageAuto::Length(val) => taffy_03::style::LengthPercentageAuto::Points(val),
-        taffy::style::LengthPercentageAuto::Percent(val) => taffy_03::style::LengthPercentageAuto::Percent(val),
-        taffy::style::LengthPercentageAuto::Auto => taffy_03::style::LengthPercentageAuto::Auto,
+    let raw = input.into_raw();
+    match raw.tag() {
+        taffy::style::CompactLength::LENGTH_TAG => taffy_03::style::LengthPercentageAuto::Points(raw.value()),
+        taffy::style::CompactLength::PERCENT_TAG => taffy_03::style::LengthPercentageAuto::Percent(raw.value()),
+        taffy::style::CompactLength::AUTO_TAG => taffy_03::style::LengthPercentageAuto::Auto,
+        _ => panic!("unsupported LengthPercentageAuto variant"),
     }
 }
 
 fn convert_length_percentage(input: taffy::style::LengthPercentage) -> taffy_03::style::LengthPercentage {
-    match input {
-        taffy::style::LengthPercentage::Length(val) => taffy_03::style::LengthPercentage::Points(val),
-        taffy::style::LengthPercentage::Percent(val) => taffy_03::style::LengthPercentage::Percent(val),
+    let raw = input.into_raw();
+    match raw.tag() {
+        taffy::style::CompactLength::LENGTH_TAG => taffy_03::style::LengthPercentage::Points(raw.value()),
+        taffy::style::CompactLength::PERCENT_TAG => taffy_03::style::LengthPercentage::Percent(raw.value()),
+        _ => panic!("unsupported LengthPercentage variant"),
     }
 }
 
@@ -148,13 +154,17 @@ fn convert_display(input: taffy::style::Display) -> taffy_03::style::Display {
         taffy::style::Display::Flex => taffy_03::style::Display::Flex,
         taffy::style::Display::Grid => taffy_03::style::Display::Grid,
         taffy::style::Display::Block => panic!("Block layout not implemented in taffy 0.3"),
+        taffy::style::Display::FlowRoot => panic!("Block layout not implemented in taffy 0.3"),
     }
 }
 
 fn convert_position(input: taffy::style::Position) -> taffy_03::style::Position {
     match input {
+        taffy::style::Position::Static => taffy_03::style::Position::Relative,
         taffy::style::Position::Relative => taffy_03::style::Position::Relative,
         taffy::style::Position::Absolute => taffy_03::style::Position::Absolute,
+        taffy::style::Position::Fixed => taffy_03::style::Position::Absolute,
+        taffy::style::Position::Sticky => taffy_03::style::Position::Relative,
     }
 }
 

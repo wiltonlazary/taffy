@@ -2,13 +2,14 @@ mod common {
     pub mod image;
     pub mod text;
 }
+
 use common::image::{image_measure_function, ImageContext};
 use common::text::{text_measure_function, FontMetrics, TextContext, WritingMode, LOREM_IPSUM};
 use taffy::tree::Cache;
 use taffy::util::print_tree;
 use taffy::{
-    compute_cached_layout, compute_flexbox_layout, compute_grid_layout, compute_leaf_layout, compute_root_layout,
-    prelude::*, round_layout,
+    compute_cached_layout, compute_flexbox_layout, compute_grid_layout, compute_leaf_layout, compute_oof_layout,
+    compute_root_layout, prelude::*, round_layout, CacheTree, LayoutContainingBlock,
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -29,6 +30,7 @@ struct Node {
     unrounded_layout: Layout,
     final_layout: Layout,
     children: Vec<Node>,
+    hoisted_children: Vec<NodeId>,
 }
 
 impl Default for Node {
@@ -42,6 +44,7 @@ impl Default for Node {
             unrounded_layout: Layout::with_order(0),
             final_layout: Layout::with_order(0),
             children: Vec::new(),
+            hoisted_children: Vec::new(),
         }
     }
 }
@@ -88,12 +91,12 @@ impl Node {
     }
 
     pub fn print_tree(&mut self) {
-        print_tree(&mut StatelessLayoutTree, unsafe { self.as_id() });
+        print_tree(&StatelessLayoutTree, unsafe { self.as_id() });
     }
 }
 
 struct ChildIter<'a>(std::slice::Iter<'a, Node>);
-impl<'a> Iterator for ChildIter<'a> {
+impl Iterator for ChildIter<'_> {
     type Item = NodeId;
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next().map(|c| NodeId::from(c as *const Node as usize))
@@ -130,7 +133,14 @@ impl TraversePartialTree for StatelessLayoutTree {
 impl TraverseTree for StatelessLayoutTree {}
 
 impl LayoutPartialTree for StatelessLayoutTree {
-    fn get_style(&self, node_id: NodeId) -> &Style {
+    type CoreContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    type CustomIdent = String;
+
+    fn get_core_container_style(&self, node_id: NodeId) -> Self::CoreContainerStyle<'_> {
         unsafe { &node_from_id(node_id).style }
     }
 
@@ -138,8 +148,8 @@ impl LayoutPartialTree for StatelessLayoutTree {
         unsafe { node_from_id_mut(node_id).unrounded_layout = *layout };
     }
 
-    fn get_cache_mut(&mut self, node_id: NodeId) -> &mut Cache {
-        unsafe { &mut node_from_id_mut(node_id).cache }
+    fn resolve_calc_value(&self, _val: *const (), _basis: f32) -> f32 {
+        0.0
     }
 
     fn compute_child_layout(&mut self, node_id: NodeId, inputs: taffy::tree::LayoutInput) -> taffy::tree::LayoutOutput {
@@ -147,32 +157,134 @@ impl LayoutPartialTree for StatelessLayoutTree {
             let node = unsafe { node_from_id_mut(node_id) };
             let font_metrics = FontMetrics { char_width: 10.0, char_height: 10.0 };
 
-            match node.kind {
+            let mut output = match node.kind {
                 NodeKind::Flexbox => compute_flexbox_layout(tree, node_id, inputs),
                 NodeKind::Grid => compute_grid_layout(tree, node_id, inputs),
-                NodeKind::Text => compute_leaf_layout(inputs, &node.style, |known_dimensions, available_space| {
-                    text_measure_function(
-                        known_dimensions,
-                        available_space,
-                        node.text_data.as_ref().unwrap(),
-                        &font_metrics,
-                    )
-                }),
-                NodeKind::Image => compute_leaf_layout(inputs, &node.style, |known_dimensions, _available_space| {
-                    image_measure_function(known_dimensions, node.image_data.as_ref().unwrap())
-                }),
+                NodeKind::Text => compute_leaf_layout(
+                    inputs,
+                    &node.style,
+                    |val, basis| tree.resolve_calc_value(val, basis),
+                    |known_dimensions, available_space| {
+                        text_measure_function(
+                            known_dimensions,
+                            available_space,
+                            node.text_data.as_ref().unwrap(),
+                            &font_metrics,
+                        )
+                    },
+                ),
+                NodeKind::Image => compute_leaf_layout(
+                    inputs,
+                    &node.style,
+                    |val, basis| tree.resolve_calc_value(val, basis),
+                    |known_dimensions, _available_space| {
+                        image_measure_function(known_dimensions, node.image_data.as_ref().unwrap())
+                    },
+                ),
+            };
+
+            // Lay out any out-of-flow (absolute/fixed) boxes for which this node is the containing block
+            if inputs.run_mode == taffy::RunMode::PerformLayout {
+                compute_oof_layout(tree, node_id, &mut output);
             }
+
+            output
         })
     }
 }
 
+impl LayoutContainingBlock for StatelessLayoutTree {
+    type OofItemStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    fn get_oof_item_style(&self, node_id: NodeId) -> Self::OofItemStyle<'_> {
+        unsafe { &node_from_id(node_id).style }
+    }
+
+    fn clear_hoisted_children(&mut self, node_id: NodeId) {
+        unsafe { node_from_id_mut(node_id).hoisted_children.clear() };
+    }
+
+    fn add_hoisted_children(&mut self, node_id: NodeId, hoisted: &[NodeId]) {
+        unsafe { node_from_id_mut(node_id).hoisted_children.extend_from_slice(hoisted) };
+    }
+}
+
+impl CacheTree for StatelessLayoutTree {
+    fn cache_get(&mut self, node_id: NodeId, inputs: &taffy::LayoutInput) -> Option<taffy::LayoutOutput> {
+        unsafe { node_from_id_mut(node_id) }.cache.get(inputs)
+    }
+
+    fn cache_store(&mut self, node_id: NodeId, inputs: &taffy::LayoutInput, layout_output: taffy::LayoutOutput) {
+        unsafe { node_from_id_mut(node_id) }.cache.store(inputs, layout_output)
+    }
+
+    fn cache_clear(&mut self, node_id: NodeId) {
+        unsafe { node_from_id_mut(node_id) }.cache.clear();
+    }
+}
+
+impl taffy::LayoutFlexboxContainer for StatelessLayoutTree {
+    type FlexboxContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    type FlexboxItemStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    fn get_flexbox_container_style(&self, node_id: NodeId) -> Self::FlexboxContainerStyle<'_> {
+        unsafe { &node_from_id(node_id).style }
+    }
+
+    fn get_flexbox_child_style(&self, child_node_id: NodeId) -> Self::FlexboxItemStyle<'_> {
+        unsafe { &node_from_id(child_node_id).style }
+    }
+}
+
+impl taffy::LayoutGridContainer for StatelessLayoutTree {
+    type GridContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    type GridItemStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+
+    fn get_grid_container_style(&self, node_id: NodeId) -> Self::GridContainerStyle<'_> {
+        unsafe { &node_from_id(node_id).style }
+    }
+
+    fn get_grid_child_style(&self, child_node_id: NodeId) -> Self::GridItemStyle<'_> {
+        unsafe { &node_from_id(child_node_id).style }
+    }
+}
+
 impl RoundTree for StatelessLayoutTree {
-    fn get_unrounded_layout(&self, node_id: NodeId) -> &Layout {
-        unsafe { &node_from_id_mut(node_id).unrounded_layout }
+    fn get_unrounded_layout(&self, node_id: NodeId) -> Layout {
+        unsafe { node_from_id_mut(node_id).unrounded_layout }
     }
 
     fn set_final_layout(&mut self, node_id: NodeId, layout: &Layout) {
         unsafe { node_from_id_mut(node_id).final_layout = *layout }
+    }
+
+    fn is_out_of_flow(&self, node_id: NodeId) -> bool {
+        unsafe { node_from_id(node_id).style.position.is_out_of_flow() }
+    }
+
+    fn hoisted_child_count(&self, node_id: NodeId) -> usize {
+        unsafe { node_from_id(node_id).hoisted_children.len() }
+    }
+
+    fn get_hoisted_child_id(&self, node_id: NodeId, index: usize) -> NodeId {
+        unsafe { node_from_id(node_id).hoisted_children[index] }
     }
 }
 
@@ -186,8 +298,8 @@ impl PrintTree for StatelessLayoutTree {
         }
     }
 
-    fn get_final_layout(&self, node_id: NodeId) -> &Layout {
-        unsafe { &node_from_id(node_id).final_layout }
+    fn get_final_layout(&self, node_id: NodeId) -> Layout {
+        unsafe { node_from_id(node_id).final_layout }
     }
 }
 

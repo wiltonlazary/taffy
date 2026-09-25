@@ -4,6 +4,20 @@ use crate::geometry::Line;
 use core::cmp::{max, Ordering};
 use core::ops::{Add, AddAssign, Sub};
 
+/// The maximum number of tracks in each direction from the start of the explicit grid (line 0 in
+/// OriginZero coordinates), and the maximum span of a single grid item. This limits the grid to
+/// `2 * MAX_GRID_TRACKS` total tracks in each axis (including explicit tracks, which count against
+/// the positive limit). Grids larger than this limit are clamped.
+///
+/// See: <https://www.w3.org/TR/css-grid-1/#overlarge-grids>
+pub(crate) const MAX_GRID_TRACKS: u16 = 10_000;
+
+/// The lowest valid grid line in OriginZero coordinates
+pub(crate) const MIN_OZ_LINE: i16 = -(MAX_GRID_TRACKS as i16);
+
+/// The highest valid grid line in OriginZero coordinates
+pub(crate) const MAX_OZ_LINE: i16 = MAX_GRID_TRACKS as i16;
+
 /// Represents a grid line position in "CSS Grid Line" coordinates
 ///
 /// "CSS Grid Line" coordinates are those used in grid-row/grid-column in the CSS grid spec:
@@ -29,7 +43,9 @@ impl GridLine {
         self.0
     }
 
-    /// Convert into OriginZero coordinates using the specified explicit track count
+    /// Convert into OriginZero coordinates using the specified explicit track count.
+    ///
+    /// The result is clamped into the limited grid `[-MAX_GRID_TRACKS, MAX_GRID_TRACKS]`
     pub(crate) fn into_origin_zero_line(self, explicit_track_count: u16) -> OriginZeroLine {
         let explicit_line_count = explicit_track_count + 1;
         let oz_line = match self.0.cmp(&0) {
@@ -37,7 +53,7 @@ impl GridLine {
             Ordering::Less => self.0 + explicit_line_count as i16,
             Ordering::Equal => panic!("Grid line of zero is invalid"),
         };
-        OriginZeroLine(oz_line)
+        OriginZeroLine(oz_line.clamp(MIN_OZ_LINE, MAX_OZ_LINE))
     }
 }
 
@@ -87,15 +103,35 @@ impl Sub<u16> for OriginZeroLine {
 impl OriginZeroLine {
     /// Converts a grid line in OriginZero coordinates into the index of that same grid line in the GridTrackVec.
     pub(crate) fn into_track_vec_index(self, track_counts: TrackCounts) -> usize {
-        assert!(
-            self.0 >= -(track_counts.negative_implicit as i16),
-            "OriginZero grid line cannot be less than the number of negative grid lines"
-        );
-        assert!(
-            self.0 <= (track_counts.explicit + track_counts.positive_implicit) as i16,
-            "OriginZero grid line cannot be more than the number of positive grid lines"
-        );
-        2 * ((self.0 + track_counts.negative_implicit as i16) as usize)
+        self.try_into_track_vec_index(track_counts).unwrap_or_else(|| {
+            if self.0 > 0 {
+                panic!("OriginZero grid line cannot be more than the number of positive grid lines");
+            } else {
+                panic!("OriginZero grid line cannot be less than the number of negative grid lines");
+            }
+        })
+    }
+
+    /// Converts a grid line in OriginZero coordinates into the index of that same grid line in the GridTrackVec.
+    ///
+    /// This fallible version is used for the placement of absolutely positioned grid items:
+    ///
+    ///    If a grid-placement property refers to a non-existent line either by explicitly specifying such a line or by
+    ///    spanning outside of the existing implicit grid, it is instead treated as specifying auto (instead of creating
+    ///    new implicit grid lines).
+    ///
+    /// The infallible version above if used when placing regular in-flow grid items.
+    pub(crate) fn try_into_track_vec_index(self, track_counts: TrackCounts) -> Option<usize> {
+        // OriginZero grid line cannot be less than the number of negative grid lines
+        if self.0 < -(track_counts.negative_implicit as i16) {
+            return None;
+        };
+        // OriginZero grid line cannot be more than the number of positive grid lines
+        if self.0 > (track_counts.explicit + track_counts.positive_implicit) as i16 {
+            return None;
+        };
+
+        Some(2 * ((self.0 + track_counts.negative_implicit as i16) as usize))
     }
 
     /// The minimum number of negative implicit track there must be if a grid item starts at this line.

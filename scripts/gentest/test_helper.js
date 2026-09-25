@@ -23,7 +23,7 @@ class TrackSizingParser {
   }
 
   parseSingleItem() {
-    return this.parseItem();
+    return this._parseItem();
   }
 
   _parseItemList(separator, terminator = null) {
@@ -118,6 +118,15 @@ function parseDimension(input, options = { allowFrUnits: false }) {
   if (input === 'auto') return { unit: 'auto' };
   if (input === 'min-content') return { unit: 'min-content' };
   if (input === 'max-content') return { unit: 'max-content' };
+  if (input === 'fit-content') return { unit: 'fit-content' };
+  if (input === 'stretch') return { unit: 'stretch' };
+  if (input === 'content') return { unit: 'content' };
+  const fitContentMatch = /^fit-content\((.*)\)$/.exec(input);
+  if (fitContentMatch) {
+    const arg = fitContentMatch[1].trim();
+    if (arg.endsWith('px')) return { unit: 'fit-content-px', value: parseFloat(arg) };
+    if (arg.endsWith('%')) return { unit: 'fit-content-percent', value: parseFloat(arg) / 100 };
+  }
   return undefined;
 }
 
@@ -191,29 +200,62 @@ function parseGridPosition(input) {
   if (input === 'auto') return { kind: 'auto' };
   if (/^span +\d+$/.test(input)) return { kind: 'span', value: parseInt(input.replace(/[^\d]/g, ''), 10) };
   if (/^-?\d+$/.test(input)) return { kind: 'line', value: parseInt(input, 10) };
+  if (/^(-?\d+ +)?[a-zA-Z_][\w-]* *(-?\d+)?$/.test(input)) return { kind: 'named', value: input };
   return undefined;
+}
+
+// Find the element whose border box the given element's layout position is measured against.
+// Out-of-flow (absolute/fixed) elements are positioned relative to their containing block:
+// the nearest positioned ancestor, or the test root (which acts as the initial containing
+// block) when there is none. All other elements are positioned relative to their parent.
+function containingBlockElement(e) {
+  const position = getComputedStyle(e).position;
+  if (e.id !== "test-root" && (position === "absolute" || position === "fixed")) {
+    let ancestor = e.parentElement;
+    while (ancestor.id !== "test-root") {
+      if (position !== "fixed" && getComputedStyle(ancestor).position !== "static") return ancestor;
+      ancestor = ancestor.parentElement;
+    }
+    return ancestor;
+  }
+  return e.parentNode;
 }
 
 function describeElement(e) {
 
-  // Get precise, unrounded dimensions for the current element and it's parent
+  // Get precise, unrounded dimensions for the current element and its position reference
+  // (parent for in-flow elements, containing block for out-of-flow elements)
   let boundingRect = e.getBoundingClientRect();
-  let parentBoundingRect = e.parentNode.getBoundingClientRect();
+  let containingBlockElementBoundingRect = containingBlockElement(e).getBoundingClientRect();
+
+  const computedStyle = getComputedStyle(e);
 
   return {
     style: {
       display: parseEnum(e.style.display),
+      boxSizing: parseEnum(computedStyle.boxSizing),
 
-      position: parseEnum(e.style.position),
-      direction: parseEnum(e.style.direction),
-      flexDirection: parseEnum(e.style.flexDirection),
+      // The computed position, not the inline style: the test base stylesheet sets
+      // `position: relative` on all divs/spans/imgs, which is what Chrome lays out with,
+      // and which no longer matches Taffy's default (`static`).
+      position: parseEnum(computedStyle.position),
+      direction: parseEnum(computedStyle.direction),
 
       writingMode: parseEnum(e.style.writingMode),
 
+      cssFloat: parseEnum(e.style.cssFloat),
+      clear: parseEnum(e.style.clear),
+
+      textAlign: parseEnum(e.style.textAlign),
+
+      flexDirection: parseEnum(e.style.flexDirection),
       flexWrap: parseEnum(e.style.flexWrap),
+      flexLineCount: parseNumber(e.style.flexLineCount),
       overflowX: parseEnum(e.style.overflowX),
       overflowY: parseEnum(e.style.overflowY),
       scrollbarWidth: getScrollBarWidth(),
+
+      contain: parseEnum(e.style.contain),
 
       alignItems: parseEnum(e.style.alignItems),
       alignSelf: parseEnum(e.style.alignSelf),
@@ -227,8 +269,10 @@ function describeElement(e) {
       flexShrink: parseNumber(e.style.flexShrink),
       flexBasis: parseDimension(e.style.flexBasis),
 
-      gridTemplateRows: parseGridTrackDefinitions(e.style.gridTemplateRows),
-      gridTemplateColumns: parseGridTrackDefinitions(e.style.gridTemplateColumns),
+      // Passed through verbatim (Taffy's test harness parses the CSS syntax directly),
+      // which preserves line names that TrackSizingParser does not handle
+      gridTemplateRows: e.style.gridTemplateRows || undefined,
+      gridTemplateColumns: e.style.gridTemplateColumns || undefined,
       gridAutoRows: parseGridTrackDefinitions(e.style.gridAutoRows),
       gridAutoColumns: parseGridTrackDefinitions(e.style.gridAutoColumns),
       gridAutoFlow: parseGridAutoFlow(e.style.gridAutoFlow),
@@ -274,6 +318,20 @@ function describeElement(e) {
       }),
     },
 
+    // The resolved value of the grid-template-rows/grid-template-columns properties
+    // (https://www.w3.org/TR/css-grid-1/#resolved-track-list): the used track sizes and line
+    // names of the grid, which Taffy exposes through DetailedGridInfo. Fixtures can opt out
+    // with data-test-resolved-track-lists="false" (e.g. overlarge grids, where Taffy's
+    // MAX_GRID_TRACKS clamp intentionally differs from Chrome's track limit)
+    resolvedGridTemplateRows:
+      computedStyle.display === "grid" && e.getAttribute("data-test-resolved-track-lists") !== "false"
+        ? computedStyle.gridTemplateRows
+        : undefined,
+    resolvedGridTemplateColumns:
+      computedStyle.display === "grid" && e.getAttribute("data-test-resolved-track-lists") !== "false"
+        ? computedStyle.gridTemplateColumns
+        : undefined,
+
     // The textContent is used for generating intrinsic sizing measure funcs
     // So we're only interested in the text content of leaf nodes
     textContent: e.childElementCount === 0 && e.textContent.length && e.textContent !== "\n" ? e.textContent : undefined,
@@ -282,8 +340,8 @@ function describeElement(e) {
     unroundedLayout: {
       width: boundingRect.width,
       height: boundingRect.height,
-      x: boundingRect.x - parentBoundingRect.x,
-      y: boundingRect.y - parentBoundingRect.y,
+      x: boundingRect.x - containingBlockElementBoundingRect.x,
+      y: boundingRect.y - containingBlockElementBoundingRect.y,
       scrollWidth: e.scrollWidth,
       scrollHeight: e.scrollHeight,
       clientWidth: e.clientWidth,
@@ -309,8 +367,8 @@ function describeElement(e) {
     smartRoundedLayout: {
       width: Math.round(boundingRect.right) - Math.round(boundingRect.left),
       height: Math.round(boundingRect.bottom) - Math.round(boundingRect.top),
-      x: Math.round(boundingRect.x - parentBoundingRect.x),
-      y: Math.round(boundingRect.y - parentBoundingRect.y),
+      x: Math.round(boundingRect.x) - Math.round(containingBlockElementBoundingRect.x),
+      y: Math.round(boundingRect.y) - Math.round(containingBlockElementBoundingRect.y),
       scrollWidth: e.scrollWidth,
       scrollHeight: e.scrollHeight,
       clientWidth: e.clientWidth,
@@ -324,6 +382,38 @@ function describeElement(e) {
 
     children: Array.from(e.children).map(c => describeElement(c)),
   };
+}
+
+// Check that the test base stylesheet has loaded and is applied. This can be false when the
+// document is not fully loaded yet, in which case the styles that implement the body classes
+// set below would be missing and every variant would be measured as border-box/ltr.
+function assertStylesheetApplied() {
+  const previousClassName = document.body.className;
+  document.body.className = "content-box rtl";
+  const probe = document.createElement("div");
+  document.body.appendChild(probe);
+  const style = getComputedStyle(probe);
+  const applied = style.direction === "rtl" && style.boxSizing === "content-box";
+  probe.remove();
+  document.body.className = previousClassName;
+  if (!applied) {
+    throw new Error(`the test base stylesheet is not applied (document readyState: ${document.readyState})`);
+  }
+}
+
+function getTestData() {
+  assertStylesheetApplied();
+
+  document.body.className = "border-box ltr";
+  const borderBoxLtrData = describeElement(document.getElementById('test-root'));
+  document.body.className = "content-box ltr";
+  const contentBoxLtrData = describeElement(document.getElementById('test-root'));
+  document.body.className = "border-box rtl";
+  const borderBoxRtlData = describeElement(document.getElementById('test-root'));
+  document.body.className = "content-box rtl";
+  const contentBoxRtlData = describeElement(document.getElementById('test-root'));
+
+  return JSON.stringify({ borderBoxLtrData, contentBoxLtrData, borderBoxRtlData, contentBoxRtlData });
 }
 
 // Useful when developing this script. Logs the parsed style to the console when any test fixture is opened in a browser.

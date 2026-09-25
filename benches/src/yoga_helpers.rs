@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use rand::distributions::uniform::SampleRange;
+use rand::distr::uniform::SampleRange;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use slotmap::{DefaultKey, SlotMap};
@@ -49,7 +49,7 @@ impl<R: Rng, G: GenStyle<TaffyStyle>> BuildTree<R, G> for YogaTreeBuilder<R, G> 
     }
 
     fn random_usize(&mut self, range: impl SampleRange<usize>) -> usize {
-        self.rng.gen_range(range)
+        self.rng.random_range(range)
     }
 
     fn create_leaf_node(&mut self) -> Self::Node {
@@ -106,7 +106,7 @@ fn create_yg_node(tree: &mut yg::YogaTree, style: &tf::Style, children: &[yg::De
     let mut node = yg::Node::new();
     apply_taffy_style(&mut node, &style);
     for (i, child) in children.into_iter().enumerate() {
-        node.insert_child(&mut tree[*child], i as u32);
+        node.insert_child(&mut tree[*child], i);
     }
     tree.insert(node)
 }
@@ -114,7 +114,7 @@ fn create_yg_node(tree: &mut yg::YogaTree, style: &tf::Style, children: &[yg::De
 pub fn new_default_style_with_children(tree: &mut yg::YogaTree, children: &[yg::DefaultKey]) -> yg::DefaultKey {
     let mut node = yg::Node::new();
     for (i, child) in children.into_iter().enumerate() {
-        node.insert_child(&mut tree[*child], i as u32);
+        node.insert_child(&mut tree[*child], i);
     }
     tree.insert(node)
 }
@@ -123,15 +123,18 @@ fn set_node_children(tree: &mut yg::YogaTree, node_id: yg::DefaultKey, children:
     // TODO: clear existing children.
     for (i, child_id) in children.into_iter().enumerate() {
         let [node, child] = tree.get_disjoint_mut([node_id, *child_id]).unwrap();
-        node.insert_child(child, i as u32);
+        node.insert_child(child, i);
     }
 }
 
 fn into_yg_units(dim: impl Into<tf::Dimension>) -> yg::StyleUnit {
-    match dim.into() {
-        tf::Dimension::Auto => yg::StyleUnit::Auto,
-        tf::Dimension::Length(val) => yg::StyleUnit::Point(yg::OrderedFloat(val)),
-        tf::Dimension::Percent(val) => yg::StyleUnit::Percent(yg::OrderedFloat(val)),
+    let dim: tf::Dimension = dim.into();
+    let val = dim.into_raw().value();
+    match dim.into_raw().tag() {
+        tf::CompactLength::AUTO_TAG => yg::StyleUnit::Auto,
+        tf::CompactLength::LENGTH_TAG => yg::StyleUnit::Point(yg::OrderedFloat(val)),
+        tf::CompactLength::PERCENT_TAG => yg::StyleUnit::Percent(yg::OrderedFloat(val)),
+        _ => unreachable!(),
     }
 }
 
@@ -140,45 +143,44 @@ fn into_pixels(dim: impl Into<tf::Dimension>) -> f32 {
 }
 
 fn items_into_align(align: Option<tf::AlignSelf>) -> yg::Align {
-    match align {
-        None => yg::Align::Auto,
-        Some(tf::AlignSelf::FlexStart) => yg::Align::FlexStart,
-        Some(tf::AlignSelf::FlexEnd) => yg::Align::FlexEnd,
-        Some(tf::AlignSelf::Center) => yg::Align::Center,
-        Some(tf::AlignSelf::Baseline) => yg::Align::Baseline,
-        Some(tf::AlignSelf::Stretch) => yg::Align::Stretch,
-        Some(tf::AlignSelf::Start) => unimplemented!(),
-        Some(tf::AlignSelf::End) => unimplemented!(),
+    // Yoga has no safe/unsafe overflow-position concept — drop the safety field and dispatch
+    // on the bare keyword. Safe and unsafe alike fold to the same yoga keyword.
+    let Some(align) = align else { return yg::Align::Auto };
+    match align.keyword {
+        tf::AlignItemsKeyword::FlexStart => yg::Align::FlexStart,
+        tf::AlignItemsKeyword::FlexEnd => yg::Align::FlexEnd,
+        tf::AlignItemsKeyword::Center => yg::Align::Center,
+        tf::AlignItemsKeyword::Baseline => yg::Align::Baseline,
+        tf::AlignItemsKeyword::Stretch => yg::Align::Stretch,
+        tf::AlignItemsKeyword::Start
+        | tf::AlignItemsKeyword::End
+        | tf::AlignItemsKeyword::SelfStart
+        | tf::AlignItemsKeyword::SelfEnd => unimplemented!(),
     }
 }
 
 fn content_into_align(align: Option<tf::AlignContent>) -> yg::Align {
-    match align {
-        None => yg::Align::Auto,
-        Some(tf::AlignContent::FlexStart) => yg::Align::FlexStart,
-        Some(tf::AlignContent::Start) => yg::Align::FlexStart,
-        Some(tf::AlignContent::FlexEnd) => yg::Align::FlexEnd,
-        Some(tf::AlignContent::End) => yg::Align::FlexEnd,
-        Some(tf::AlignContent::Center) => yg::Align::Center,
-        Some(tf::AlignContent::Stretch) => yg::Align::Stretch,
-        Some(tf::AlignContent::SpaceBetween) => yg::Align::SpaceBetween,
-        Some(tf::AlignContent::SpaceAround) => yg::Align::SpaceAround,
-        Some(tf::AlignContent::SpaceEvenly) => unimplemented!(),
+    let Some(align) = align else { return yg::Align::Auto };
+    match align.keyword {
+        tf::AlignContentKeyword::FlexStart | tf::AlignContentKeyword::Start => yg::Align::FlexStart,
+        tf::AlignContentKeyword::FlexEnd | tf::AlignContentKeyword::End => yg::Align::FlexEnd,
+        tf::AlignContentKeyword::Center => yg::Align::Center,
+        tf::AlignContentKeyword::Stretch => yg::Align::Stretch,
+        tf::AlignContentKeyword::SpaceBetween => yg::Align::SpaceBetween,
+        tf::AlignContentKeyword::SpaceAround => yg::Align::SpaceAround,
+        tf::AlignContentKeyword::SpaceEvenly => unimplemented!(),
     }
 }
 
 fn content_into_justify(align: Option<tf::JustifyContent>) -> yg::Justify {
-    match align {
-        None => yg::Justify::FlexStart,
-        Some(tf::JustifyContent::FlexStart) => yg::Justify::FlexStart,
-        Some(tf::JustifyContent::Start) => yg::Justify::FlexStart,
-        Some(tf::JustifyContent::FlexEnd) => yg::Justify::FlexEnd,
-        Some(tf::JustifyContent::End) => yg::Justify::FlexEnd,
-        Some(tf::JustifyContent::Center) => yg::Justify::Center,
-        Some(tf::JustifyContent::SpaceBetween) => yg::Justify::SpaceBetween,
-        Some(tf::JustifyContent::SpaceAround) => yg::Justify::SpaceAround,
-        Some(tf::JustifyContent::Stretch) => unimplemented!(),
-        Some(tf::JustifyContent::SpaceEvenly) => unimplemented!(),
+    let Some(align) = align else { return yg::Justify::FlexStart };
+    match align.keyword {
+        tf::AlignContentKeyword::FlexStart | tf::AlignContentKeyword::Start => yg::Justify::FlexStart,
+        tf::AlignContentKeyword::FlexEnd | tf::AlignContentKeyword::End => yg::Justify::FlexEnd,
+        tf::AlignContentKeyword::Center => yg::Justify::Center,
+        tf::AlignContentKeyword::SpaceBetween => yg::Justify::SpaceBetween,
+        tf::AlignContentKeyword::SpaceAround => yg::Justify::SpaceAround,
+        tf::AlignContentKeyword::Stretch | tf::AlignContentKeyword::SpaceEvenly => unimplemented!(),
     }
 }
 
@@ -189,12 +191,22 @@ fn apply_taffy_style(node: &mut yg::Node, style: &tf::Style) {
         tf::Display::Flex => yg::Display::Flex,
         tf::Display::Grid => panic!("Yoga does not support CSS Grid layout"),
         tf::Display::Block => panic!("Yoga does not support CSS Block layout"),
+        tf::Display::FlowRoot => panic!("Yoga does not support CSS Block layout"),
+    });
+
+    // box_sizing
+    node.set_box_sizing(match style.box_sizing {
+        tf::BoxSizing::BorderBox => yg::BoxSizing::BorderBox,
+        tf::BoxSizing::ContentBox => yg::BoxSizing::ContentBox,
     });
 
     // position
     node.set_position_type(match style.position {
+        tf::Position::Static => yg::PositionType::Static,
         tf::Position::Relative => yg::PositionType::Relative,
         tf::Position::Absolute => yg::PositionType::Absolute,
+        tf::Position::Fixed => yg::PositionType::Absolute,
+        tf::Position::Sticky => yg::PositionType::Static,
     });
     // inset
     node.set_position(yg::Edge::Left, into_yg_units(style.inset.left));
@@ -236,8 +248,8 @@ fn apply_taffy_style(node: &mut yg::Node, style: &tf::Style) {
     node.set_justify_content(content_into_justify(style.justify_content));
 
     // gap
-    node.set_column_gap(into_pixels(style.gap.width));
-    node.set_row_gap(into_pixels(style.gap.height));
+    node.set_column_gap(into_yg_units(style.gap.width));
+    node.set_row_gap(into_yg_units(style.gap.height));
 
     // flex
     node.set_flex_direction(match style.flex_direction {
@@ -250,6 +262,9 @@ fn apply_taffy_style(node: &mut yg::Node, style: &tf::Style) {
         tf::FlexWrap::NoWrap => yg::Wrap::NoWrap,
         tf::FlexWrap::Wrap => yg::Wrap::Wrap,
         tf::FlexWrap::WrapReverse => yg::Wrap::WrapReverse,
+        // Yoga has no equivalent of `flex-wrap: balance`
+        tf::FlexWrap::Balance => yg::Wrap::Wrap,
+        tf::FlexWrap::BalanceReverse => yg::Wrap::WrapReverse,
     });
     node.set_flex_basis(into_yg_units(style.flex_basis));
     node.set_flex_grow(style.flex_grow);

@@ -1,0 +1,439 @@
+use roxmltree::Document;
+use std::{fmt::Debug, io::Write, path::PathBuf, str::FromStr};
+use taffy::{
+    prelude::TaffyZero as _, AvailableSpace, CheapCloneStr, Dimension, GridAutoTracks, GridTemplateComponent,
+    GridTemplateTracks, LengthPercentage, LengthPercentageAuto, Line, NodeId, Point, PrintTree, Rect, Size, TaffyTree,
+};
+use taffy_test_helpers::{test_measure_function, TestNodeContext};
+
+#[path = "./xml/mod.rs"]
+mod xml;
+
+#[derive(Debug)]
+struct OutputNode {
+    node_id: NodeId,
+    location: Point<f32>,
+    size: Size<f32>,
+    scroll_size: Option<Size<f32>>,
+    resolved_rows: Option<String>,
+    resolved_columns: Option<String>,
+    children: Vec<OutputNode>,
+}
+
+/// A single token of a resolved track list string
+/// (see <https://www.w3.org/TR/css-grid-1/#resolved-track-list>)
+#[derive(Debug, PartialEq)]
+enum TrackListToken {
+    /// A bracketed line name group, e.g. `[foo bar]`
+    Names(Vec<String>),
+    /// A used track size in pixels, e.g. `10.5px`
+    Size(f32),
+}
+
+/// Parse a resolved track list string (e.g. `[foo] 10px 20.5px [bar baz]` or `none`) into tokens
+fn parse_track_list(input: &str) -> Vec<TrackListToken> {
+    let input = input.trim();
+    if input == "none" {
+        return Vec::new();
+    }
+    let mut tokens = Vec::new();
+    let mut rest = input;
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after_bracket) = rest.strip_prefix('[') {
+            let end = after_bracket.find(']').unwrap_or_else(|| panic!("unterminated line name group in {input:?}"));
+            let names = after_bracket[..end].split_whitespace().map(str::to_string).collect();
+            tokens.push(TrackListToken::Names(names));
+            rest = &after_bracket[end + 1..];
+        } else {
+            let end = rest.find(' ').unwrap_or(rest.len());
+            let size = rest[..end]
+                .strip_suffix("px")
+                .and_then(|size| size.parse::<f32>().ok())
+                .unwrap_or_else(|| panic!("invalid track size {:?} in {input:?}", &rest[..end]));
+            tokens.push(TrackListToken::Size(size));
+            rest = &rest[end..];
+        }
+    }
+    tokens
+}
+
+/// Compare two resolved track list strings, comparing line names exactly and track sizes with
+/// a tolerance (Chrome and Taffy format/round subpixel used sizes slightly differently)
+fn track_lists_match(expected: &str, actual: &str) -> bool {
+    let expected = parse_track_list(expected);
+    let actual = parse_track_list(actual);
+    expected.len() == actual.len()
+        && expected.iter().zip(actual.iter()).all(|(expected, actual)| match (expected, actual) {
+            (TrackListToken::Size(expected), TrackListToken::Size(actual)) => (expected - actual).abs() < 0.1,
+            (expected, actual) => expected == actual,
+        })
+}
+
+impl PartialEq for OutputNode {
+    fn eq(&self, other: &Self) -> bool {
+        let scroll_size_matches = match (self.scroll_size, other.scroll_size) {
+            (Some(expected), Some(actual)) => {
+                (expected.width - actual.width).abs() < 0.1 && (expected.height - actual.height).abs() < 0.1
+            }
+            // Only assert scroll sizes when both the expectation and the computed value are available
+            _ => true,
+        };
+        // Only assert resolved track lists when both the expectation and the computed value are available
+        let track_lists_match = |expected: &Option<String>, actual: &Option<String>| match (expected, actual) {
+            (Some(expected), Some(actual)) => track_lists_match(expected, actual),
+            _ => true,
+        };
+        let resolved_rows_match = track_lists_match(&self.resolved_rows, &other.resolved_rows);
+        let resolved_columns_match = track_lists_match(&self.resolved_columns, &other.resolved_columns);
+        self.node_id == other.node_id
+            && (self.location.x - other.location.x).abs() < 0.1
+            && (self.location.y - other.location.y).abs() < 0.1
+            && (self.size.width - other.size.width).abs() < 0.1
+            && (self.size.height - other.size.height).abs() < 0.1
+            && scroll_size_matches
+            && resolved_rows_match
+            && resolved_columns_match
+            && self.children == other.children
+    }
+}
+
+impl OutputNode {
+    fn write_metrics(&self, w: &mut impl Write) {
+        write!(
+            w,
+            "[x: {:<4} y: {:<4} w: {:<4} h: {:<4}]",
+            self.location.x, self.location.y, self.size.width, self.size.height
+        )
+        .unwrap();
+        if let Some(scroll_size) = self.scroll_size {
+            write!(w, " [scroll_w: {:<4} scroll_h: {:<4}]", scroll_size.width, scroll_size.height).unwrap();
+        }
+        if let Some(resolved_rows) = &self.resolved_rows {
+            write!(w, " [rows: {resolved_rows}]").unwrap();
+        }
+        if let Some(resolved_columns) = &self.resolved_columns {
+            write!(w, " [columns: {resolved_columns}]").unwrap();
+        }
+    }
+
+    /// Prints a debug representation of the computed layout for a tree of nodes
+    fn write_tree(&self, out: &mut impl Write) {
+        writeln!(out, "TREE").unwrap();
+        print_node(out, self, false, String::new());
+
+        /// Recursive function that prints each node in the tree
+        fn print_node(out: &mut impl Write, node: &OutputNode, has_sibling: bool, lines_string: String) {
+            let num_children = node.children.len();
+            let fork_string = if has_sibling { "├── " } else { "└── " };
+
+            write!(out, "{lines_string}{fork_string} {:?} ", node.node_id).unwrap();
+            node.write_metrics(out);
+            let bar = if has_sibling { "│   " } else { "    " };
+            let new_string = lines_string + bar;
+            writeln!(out).unwrap();
+
+            // Recurse into children
+            for (index, child) in node.children.iter().enumerate() {
+                let has_sibling = index < num_children - 1;
+                print_node(out, child, has_sibling, new_string.clone());
+            }
+        }
+    }
+
+    fn print_tree(&self) {
+        let mut s: Vec<u8> = Vec::new();
+        self.write_tree(&mut s);
+        let s = String::from_utf8(s).unwrap();
+        println!("{s}");
+    }
+}
+
+#[test]
+fn get_dir() {
+    let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let test_dir = root_dir.join("tests");
+    let xml_test_dir = test_dir.join("xml");
+    println!("{}", xml_test_dir.display())
+}
+
+fn run_xml_test(group: &str, name: &str) {
+    let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let test_dir = root_dir.join("tests");
+    let xml_test_dir = test_dir.join("xml");
+
+    let test_xml_file = {
+        let mut path = xml_test_dir.join(group).join(name);
+        path.set_extension("xml");
+        path
+    };
+
+    let raw_xml = std::fs::read_to_string(&test_xml_file).expect("test file should exist");
+    let test = Document::parse(&raw_xml).unwrap();
+
+    let root = test.root_element();
+    let use_rounding: bool = parse_or(root.attribute("use-rounding"), true);
+    let viewport = root.children().find(|node| node.has_tag_name("viewport")).unwrap();
+    let input = root.children().find(|node| node.has_tag_name("input")).unwrap();
+    let expectations = root.children().find(|node| node.has_tag_name("expectations")).unwrap();
+
+    let available_space = Size {
+        width: parse_or(viewport.attribute("width"), AvailableSpace::MaxContent),
+        height: parse_or(viewport.attribute("height"), AvailableSpace::MaxContent),
+    };
+
+    // Construct tree and expectations
+    let mut tree = TaffyTree::<TestNodeContext>::new();
+    if use_rounding {
+        tree.enable_rounding();
+    } else {
+        tree.disable_rounding();
+    }
+    let expected_output = construct_tree(
+        input.first_element_child().unwrap(),
+        expectations.first_element_child().unwrap(),
+        &mut tree,
+        None,
+    );
+    let root_node_id = expected_output.node_id;
+
+    // Compute layout
+    tree.compute_layout_with_measure(root_node_id, available_space, test_measure_function).unwrap();
+    let actual_output = get_computed_expectations(&tree, root_node_id);
+
+    println!("\nINPUT");
+    println!("{raw_xml}");
+
+    tree.print_tree(root_node_id);
+
+    println!("\nEXPECTED");
+    expected_output.print_tree();
+    println!("\nACTUAL");
+    actual_output.print_tree();
+
+    assert_eq!(expected_output, actual_output);
+}
+
+fn construct_tree(
+    input: roxmltree::Node,
+    expected_x: roxmltree::Node,
+    tree: &mut TaffyTree<TestNodeContext>,
+    parent: Option<taffy::NodeId>,
+) -> OutputNode {
+    if input.first_element_child().is_some() {
+        let tnode = tree.new_with_children(build_style(input), &[]).unwrap();
+        let mut expected = build_expectations(expected_x, tnode);
+
+        if let Some(parent) = parent {
+            tree.add_child(parent, tnode).unwrap();
+        }
+
+        for (child, child_expected_x) in input
+            .children()
+            .filter(|node| node.is_element())
+            .zip(expected_x.children().filter(|node| node.is_element()))
+        {
+            expected.children.push(construct_tree(child, child_expected_x, tree, Some(tnode)));
+        }
+        expected
+    } else {
+        let text_content = input.text().map(|text| text.trim());
+        // let aspect_ratio = input.attribute("aspect-ratio");
+        let writing_mode = parse_or_default(input.attribute("writing-mode"));
+
+        let tnode = tree.new_leaf(build_style(input)).unwrap();
+        tree.set_node_context(
+            tnode,
+            text_content.map(|text_content| TestNodeContext::ahem_text(text_content.to_string(), writing_mode)),
+        )
+        .unwrap();
+
+        if let Some(parent) = parent {
+            tree.add_child(parent, tnode).unwrap();
+        }
+
+        build_expectations(expected_x, tnode)
+    }
+}
+
+fn parse_or_default<T: FromStr<Err: Debug> + Default>(input: Option<&str>) -> T {
+    parse_or(input, Default::default())
+}
+
+fn parse_or<T: FromStr<Err: Debug>>(input: Option<&str>, fallback: T) -> T {
+    input.map(|input| input.parse().unwrap()).unwrap_or(fallback)
+}
+
+fn maybe_parse<T: FromStr>(input: Option<&str>) -> Option<T> {
+    input.and_then(|input| input.parse().ok())
+}
+
+fn get_computed_expectations(tree: &TaffyTree<TestNodeContext>, node_id: NodeId) -> OutputNode {
+    let layout = tree.get_final_layout(node_id);
+    #[cfg(feature = "content_size")]
+    let scroll_size = Some(Size { width: layout.scroll_width(), height: layout.scroll_height() });
+    #[cfg(not(feature = "content_size"))]
+    let scroll_size = None;
+    let (resolved_rows, resolved_columns) = get_resolved_track_lists(tree, node_id);
+    let mut output = OutputNode {
+        node_id,
+        location: layout.location,
+        size: layout.size,
+        scroll_size,
+        resolved_rows,
+        resolved_columns,
+        children: Vec::new(),
+    };
+
+    for child_id in tree.children(node_id).unwrap() {
+        output.children.push(get_computed_expectations(tree, child_id));
+    }
+
+    output
+}
+
+/// Get the resolved value of the grid-template-rows/grid-template-columns properties for grid
+/// containers, as exposed through [`taffy::DetailedGridInfo`]
+#[cfg(all(feature = "grid", feature = "detailed_layout_info"))]
+fn get_resolved_track_lists(tree: &TaffyTree<TestNodeContext>, node_id: NodeId) -> (Option<String>, Option<String>) {
+    match tree.detailed_layout_info(node_id) {
+        taffy::DetailedLayoutInfo::Grid(info) => (Some(info.grid_template_rows()), Some(info.grid_template_columns())),
+        taffy::DetailedLayoutInfo::None => (None, None),
+    }
+}
+
+#[cfg(not(all(feature = "grid", feature = "detailed_layout_info")))]
+fn get_resolved_track_lists(_tree: &TaffyTree<TestNodeContext>, _node_id: NodeId) -> (Option<String>, Option<String>) {
+    (None, None)
+}
+
+fn build_expectations(xnode: roxmltree::Node, node_id: NodeId) -> OutputNode {
+    let scroll_size =
+        match (maybe_parse(xnode.attribute("scroll_width")), maybe_parse(xnode.attribute("scroll_height"))) {
+            (Some(width), Some(height)) => Some(Size { width, height }),
+            _ => None,
+        };
+    OutputNode {
+        node_id,
+        location: Point {
+            x: xnode.attribute("x").unwrap().parse().unwrap(),
+            y: xnode.attribute("y").unwrap().parse().unwrap(),
+        },
+        size: Size {
+            width: xnode.attribute("width").unwrap().parse().unwrap(),
+            height: xnode.attribute("height").unwrap().parse().unwrap(),
+        },
+        scroll_size,
+        resolved_rows: xnode.attribute("resolved-rows").map(str::to_string),
+        resolved_columns: xnode.attribute("resolved-columns").map(str::to_string),
+        children: Vec::new(),
+    }
+}
+
+fn build_style<S: CheapCloneStr>(xnode: roxmltree::Node) -> taffy::Style<S> {
+    let grid_template_rows: GridTemplateTracks<S, GridTemplateComponent<S>> =
+        parse_or_default(xnode.attribute("grid-template-rows"));
+    let grid_template_columns: GridTemplateTracks<S, GridTemplateComponent<S>> =
+        parse_or_default(xnode.attribute("grid-template-columns"));
+
+    taffy::Style {
+        dummy: std::marker::PhantomData,
+        display: parse_or_default(xnode.attribute("display")),
+        direction: parse_or_default(xnode.attribute("direction")),
+        item_is_table: false,
+        item_is_replaced: false,
+        box_sizing: parse_or_default(xnode.attribute("box-sizing")),
+        overflow: Point {
+            x: parse_or_default(xnode.attribute("overflow-x")),
+            y: parse_or_default(xnode.attribute("overflow-y")),
+        },
+        scrollbar_width: parse_or_default(xnode.attribute("scrollbar-width")),
+        contain: parse_or_default(xnode.attribute("contain")),
+        float: parse_or_default(xnode.attribute("float")),
+        clear: parse_or_default(xnode.attribute("clear")),
+        position: parse_or_default(xnode.attribute("position")),
+
+        size: Size {
+            width: parse_or(xnode.attribute("width"), Dimension::auto()),
+            height: parse_or(xnode.attribute("height"), Dimension::auto()),
+        },
+        min_size: Size {
+            width: parse_or(xnode.attribute("min-width"), LengthPercentageAuto::auto()),
+            height: parse_or(xnode.attribute("min-height"), LengthPercentageAuto::auto()),
+        },
+        max_size: Size {
+            width: parse_or(xnode.attribute("max-width"), LengthPercentageAuto::auto()),
+            height: parse_or(xnode.attribute("max-height"), LengthPercentageAuto::auto()),
+        },
+        inset: Rect {
+            top: parse_or(xnode.attribute("top"), LengthPercentageAuto::auto()),
+            left: parse_or(xnode.attribute("left"), LengthPercentageAuto::auto()),
+            bottom: parse_or(xnode.attribute("bottom"), LengthPercentageAuto::auto()),
+            right: parse_or(xnode.attribute("right"), LengthPercentageAuto::auto()),
+        },
+        margin: Rect {
+            top: parse_or(xnode.attribute("margin-top"), LengthPercentageAuto::ZERO),
+            left: parse_or(xnode.attribute("margin-left"), LengthPercentageAuto::ZERO),
+            bottom: parse_or(xnode.attribute("margin-bottom"), LengthPercentageAuto::ZERO),
+            right: parse_or(xnode.attribute("margin-right"), LengthPercentageAuto::ZERO),
+        },
+        padding: Rect {
+            top: parse_or(xnode.attribute("padding-top"), LengthPercentage::ZERO),
+            left: parse_or(xnode.attribute("padding-left"), LengthPercentage::ZERO),
+            bottom: parse_or(xnode.attribute("padding-bottom"), LengthPercentage::ZERO),
+            right: parse_or(xnode.attribute("padding-right"), LengthPercentage::ZERO),
+        },
+        border: Rect {
+            top: parse_or(xnode.attribute("border-top"), LengthPercentage::ZERO),
+            left: parse_or(xnode.attribute("border-left"), LengthPercentage::ZERO),
+            bottom: parse_or(xnode.attribute("border-bottom"), LengthPercentage::ZERO),
+            right: parse_or(xnode.attribute("border-right"), LengthPercentage::ZERO),
+        },
+        gap: Size {
+            width: parse_or(xnode.attribute("column-gap"), LengthPercentage::ZERO),
+            height: parse_or(xnode.attribute("row-gap"), LengthPercentage::ZERO),
+        },
+
+        aspect_ratio: maybe_parse(xnode.attribute("aspect-ratio")),
+        align_items: maybe_parse(xnode.attribute("align-items")),
+        align_self: maybe_parse(xnode.attribute("align-self")),
+        justify_items: maybe_parse(xnode.attribute("justify-items")),
+        justify_self: maybe_parse(xnode.attribute("justify-self")),
+        align_content: maybe_parse(xnode.attribute("align-content")),
+        justify_content: maybe_parse(xnode.attribute("justify-content")),
+
+        text_align: parse_or_default(xnode.attribute("text-align")),
+        flex_direction: parse_or_default(xnode.attribute("flex-direction")),
+        flex_wrap: parse_or_default(xnode.attribute("flex-wrap")),
+        #[cfg(feature = "flexbox_balance")]
+        flex_line_count: parse_or(xnode.attribute("flex-line-count"), 1),
+        flex_grow: parse_or(xnode.attribute("flex-grow"), 0.0),
+        flex_shrink: parse_or(xnode.attribute("flex-shrink"), 1.0),
+        flex_basis: parse_or(xnode.attribute("flex-basis"), Dimension::auto()),
+
+        grid_auto_flow: parse_or_default(xnode.attribute("grid-auto-flow")),
+
+        grid_template_rows: grid_template_rows.tracks,
+        grid_template_row_names: grid_template_rows.line_names,
+
+        grid_template_columns: grid_template_columns.tracks,
+        grid_template_column_names: grid_template_columns.line_names,
+
+        // TODO
+        grid_auto_rows: parse_or_default::<GridAutoTracks>(xnode.attribute("grid-auto-rows")).0,
+        grid_auto_columns: parse_or_default::<GridAutoTracks>(xnode.attribute("grid-auto-columns")).0,
+        grid_template_areas: Default::default(),
+
+        grid_row: Line {
+            start: parse_or_default(xnode.attribute("grid-row-start")),
+            end: parse_or_default(xnode.attribute("grid-row-end")),
+        },
+        grid_column: Line {
+            start: parse_or_default(xnode.attribute("grid-column-start")),
+            end: parse_or_default(xnode.attribute("grid-column-end")),
+        },
+    }
+}
